@@ -12,25 +12,38 @@ The system consists of two identical backend clusters (US and EU), each with its
 
 ```mermaid
 graph TD
-    Client[Client / User] --> Nginx[NGINX Reverse Proxy]
+    Client["Client / User"]
 
-    subgraph "US Region"
-        Nginx -->|/us/*| BackendUS[Backend Service US]
-        BackendUS -->|Reads/Writes| DB_US[(PostgreSQL US)]
-        BackendUS -->|Produces Updates| Kafka[Kafka Broker]
+    subgraph Global["Global Infrastructure"]
+        Nginx["NGINX Reverse Proxy"]
+        Kafka["Apache Kafka (property-updates)"]
+        ZK["Zookeeper"]
+        ZK --> Kafka
     end
 
-    subgraph "EU Region"
-        Nginx -->|/eu/*| BackendEU[Backend Service EU]
-        BackendEU -->|Reads/Writes| DB_EU[(PostgreSQL EU)]
-        BackendEU -->|Produces Updates| Kafka
+    subgraph US["US Region"]
+        BackendUS["Backend Service US"]
+        DB_US[("PostgreSQL US")]
     end
 
-    Kafka -->|Consumes Updates (Replication)| BackendUS
-    Kafka -->|Consumes Updates (Replication)| BackendEU
+    subgraph EU["EU Region"]
+        BackendEU["Backend Service EU"]
+        DB_EU[("PostgreSQL EU")]
+    end
 
-    BackendUS -.->|Failover| BackendEU
-    BackendEU -.->|Failover| BackendUS
+    Client --> Nginx
+    Nginx -->|"/us/* (primary)"| BackendUS
+    Nginx -->|"/eu/* (primary)"| BackendEU
+    Nginx -.->|"/us/* failover"| BackendEU
+    Nginx -.->|"/eu/* failover"| BackendUS
+
+    BackendUS --> DB_US
+    BackendEU --> DB_EU
+
+    BackendUS -->|"Produce"| Kafka
+    BackendEU -->|"Produce"| Kafka
+    Kafka -->|"Consume (replicate)"| BackendUS
+    Kafka -->|"Consume (replicate)"| BackendEU
 ```
 
 ### 2.2 Component Description
