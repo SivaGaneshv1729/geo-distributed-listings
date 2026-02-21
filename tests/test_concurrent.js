@@ -1,11 +1,12 @@
 const http = require('http');
 const crypto = require('crypto');
 
-// Helper to make a PUT request
-function makeRequest(region, id, price, version, requestId) {
+const BASE_URL = 'http://localhost:8080';
+
+// Helper: make a PUT request
+function putProperty(region, id, price, version, requestId) {
     return new Promise((resolve, reject) => {
         const data = JSON.stringify({ price, version });
-        
         const options = {
             hostname: 'localhost',
             port: 8080,
@@ -13,135 +14,173 @@ function makeRequest(region, id, price, version, requestId) {
             method: 'PUT',
             headers: {
                 'Content-Type': 'application/json',
-                'Content-Length': data.length,
+                'Content-Length': Buffer.byteLength(data),
                 'X-Request-ID': requestId || crypto.randomUUID()
             }
         };
-
         const req = http.request(options, (res) => {
             let body = '';
             res.on('data', chunk => body += chunk);
             res.on('end', () => {
-                resolve({ status: res.statusCode, body: body ? JSON.parse(body) : {} });
+                try { resolve({ status: res.statusCode, body: body ? JSON.parse(body) : {} }); }
+                catch (e) { resolve({ status: res.statusCode, body: {} }); }
             });
         });
-
-        req.on('error', (e) => reject(e));
+        req.on('error', reject);
         req.write(data);
         req.end();
     });
 }
 
+// Helper: GET a property
+function getProperty(region, id) {
+    return new Promise((resolve, reject) => {
+        http.get(`${BASE_URL}/${region}/properties/${id}`, (res) => {
+            let body = '';
+            res.on('data', c => body += c);
+            res.on('end', () => {
+                try { resolve({ status: res.statusCode, body: JSON.parse(body) }); }
+                catch (e) { resolve({ status: res.statusCode, body: {} }); }
+            });
+        }).on('error', reject);
+    });
+}
+
+// Helper: GET replication lag
+function getReplicationLag(region) {
+    return new Promise((resolve, reject) => {
+        http.get(`${BASE_URL}/${region}/replication-lag`, (res) => {
+            let body = '';
+            res.on('data', c => body += c);
+            res.on('end', () => {
+                try { resolve(JSON.parse(body)); }
+                catch (e) { resolve({}); }
+            });
+        }).on('error', reject);
+    });
+}
+
+// ─── Test 1: Optimistic Locking (Concurrent Updates) ─────────────────────────
 async function testConcurrentUpdates() {
-    console.log('Starting Concurrent Update Test...');
-    
-    // Pick a property, e.g., ID 1 (US region)
-    // First, get its current version? The seed says version starts at 1.
-    // We assume version is 1.
-    const propertyId = 1;
-    const initialVersion = 1;
+    console.log('\n=== TEST 1: Optimistic Locking (Concurrent Updates) ===');
 
-    console.log(`Sending two concurrent requests for Property ${propertyId} with version ${initialVersion}...`);
+    // Dynamically fetch current version
+    const prop = await getProperty('us', 1);
+    if (prop.status !== 200) {
+        console.error('  ✘ SKIP: Could not fetch property 1 to get current version.');
+        return;
+    }
+    const currentVersion = prop.body.version;
+    console.log(`  Property 1 current version: ${currentVersion}`);
+    console.log('  Sending two concurrent PUT requests with the same version...');
 
-    const req1 = makeRequest('us', propertyId, 200000, initialVersion, crypto.randomUUID());
-    const req2 = makeRequest('us', propertyId, 300000, initialVersion, crypto.randomUUID());
+    const [r1, r2] = await Promise.all([
+        putProperty('us', 1, 200000, currentVersion, crypto.randomUUID()),
+        putProperty('us', 1, 300000, currentVersion, crypto.randomUUID()),
+    ]);
 
-    try {
-        const results = await Promise.all([req1, req2]);
-        
-        console.log('Results:', results);
+    console.log(`  Request 1: ${r1.status}`, r1.body);
+    console.log(`  Request 2: ${r2.status}`, r2.body);
 
-        const successes = results.filter(r => r.status === 200);
-        const conflicts = results.filter(r => r.status === 409);
+    const successes = [r1, r2].filter(r => r.status === 200);
+    const conflicts = [r1, r2].filter(r => r.status === 409);
 
-        if (successes.length === 1 && conflicts.length === 1) {
-            console.log('SUCCESS: Optimistic locking worked! One request succeeded, one failed with 409.');
-        } else {
-            console.error('FAILURE: Unexpected outcome.', results);
-            process.exit(1);
-        }
-
-    } catch (err) {
-        console.error('Test Error:', err);
+    if (successes.length === 1 && conflicts.length === 1) {
+        console.log('  ✔ SUCCESS: Optimistic locking worked — 1 success (200), 1 conflict (409).');
+    } else {
+        console.error('  ✘ FAILURE: Unexpected outcome. Both may have succeeded or both failed.');
+        process.exitCode = 1;
     }
 }
 
+// ─── Test 2: Idempotency ──────────────────────────────────────────────────────
 async function testIdempotency() {
-    console.log('\nStarting Idempotency Test...');
-    const propertyId = 2; // Use a different property
-    const version = 1;
+    console.log('\n=== TEST 2: Idempotency (X-Request-ID) ===');
+
+    // Dynamically fetch current version for property 2
+    const prop = await getProperty('us', 2);
+    if (prop.status !== 200) {
+        console.error('  ✘ SKIP: Could not fetch property 2.');
+        return;
+    }
+    const currentVersion = prop.body.version;
     const reqId = crypto.randomUUID();
 
-    console.log(`Sending first request with ID ${reqId}...`);
-    const res1 = await makeRequest('us', propertyId, 250000, version, reqId);
-    console.log(`Response 1: ${res1.status}`);
+    console.log(`  Property 2 current version: ${currentVersion}`);
+    console.log(`  Sending first request with X-Request-ID: ${reqId}...`);
+    const r1 = await putProperty('us', 2, 250000, currentVersion, reqId);
+    console.log(`  Response 1: ${r1.status}`);
 
-    if (res1.status !== 200) {
-        console.error('FAILURE: First request failed.');
+    if (r1.status !== 200) {
+        console.error('  ✘ FAILURE: First request did not succeed.', r1.body);
+        process.exitCode = 1;
         return;
     }
 
-    console.log(`Sending second request with SAME ID ${reqId}...`);
-    const res2 = await makeRequest('us', propertyId, 250000, version, reqId);
-    console.log(`Response 2: ${res2.status}`);
+    console.log(`  Sending second (duplicate) request with SAME X-Request-ID...`);
+    const r2 = await putProperty('us', 2, 250000, currentVersion, reqId);
+    console.log(`  Response 2: ${r2.status}`);
 
-    if (res2.status === 422) {
-        console.log('SUCCESS: Duplicate request rejected with 422.');
+    if (r2.status === 422) {
+        console.log('  ✔ SUCCESS: Duplicate request rejected with 422 Unprocessable Entity.');
     } else {
-        console.error(`FAILURE: Expected 422, got ${res2.status}`);
+        console.error(`  ✘ FAILURE: Expected 422, got ${r2.status}.`);
+        process.exitCode = 1;
     }
 }
 
-// Run tests
+// ─── Test 3: Cross-Region Replication ────────────────────────────────────────
+async function testReplication() {
+    console.log('\n=== TEST 3: Cross-Region Replication via Kafka ===');
+
+    // Fetch current version of property 3 in US
+    const prop = await getProperty('us', 3);
+    if (prop.status !== 200) {
+        console.error('  ✘ SKIP: Could not fetch property 3 from US.');
+        return;
+    }
+    const currentVersion = prop.body.version;
+    const newPrice = 999999;
+    console.log(`  Property 3 (US) current version: ${currentVersion}, updating price to ${newPrice}...`);
+
+    const updateRes = await putProperty('us', 3, newPrice, currentVersion, crypto.randomUUID());
+    if (updateRes.status !== 200) {
+        console.error('  ✘ FAILURE: Update to US property 3 failed.', updateRes.body);
+        process.exitCode = 1;
+        return;
+    }
+    console.log(`  ✔ US update successful. New version: ${updateRes.body.version}`);
+
+    // Wait for Kafka replication
+    const waitSec = 5;
+    console.log(`  Waiting ${waitSec}s for Kafka replication to EU...`);
+    await new Promise(r => setTimeout(r, waitSec * 1000));
+
+    // Verify via GET on EU endpoint
+    const euProp = await getProperty('eu', 3);
+    if (euProp.status === 200 && parseFloat(euProp.body.price) === newPrice) {
+        console.log(`  ✔ SUCCESS: EU now shows property 3 with price ${euProp.body.price} (version ${euProp.body.version}).`);
+    } else {
+        console.error(`  ✘ FAILURE: EU property 3 not replicated correctly.`, euProp.body);
+        process.exitCode = 1;
+    }
+
+    // Check replication lag
+    const lag = await getReplicationLag('eu');
+    console.log(`  EU Replication Lag: ${lag.lag_seconds}s`);
+    if (typeof lag.lag_seconds === 'number') {
+        console.log('  ✔ Replication lag endpoint is working.');
+    }
+}
+
+// ─── Run All Tests ────────────────────────────────────────────────────────────
 (async () => {
-    // Wait for services to be ready
-    console.log('Waiting 10s for services to stabilize...');
-    await new Promise(r => setTimeout(r, 10000));
+    console.log('Waiting 5s for services to stabilize...');
+    await new Promise(r => setTimeout(r, 5000));
 
     await testConcurrentUpdates();
     await testIdempotency();
-    
-    // Test Replication
-    console.log('\nStarting Replication Test...');
-    // Update Property 3 in US
-    const propId = 3;
-    const reqId = crypto.randomUUID();
-    console.log(`Updating Property ${propId} in US...`);
-    const res = await makeRequest('us', propId, 400000, 1, reqId);
-    if (res.status === 200) {
-        console.log('Update successful. Waiting for replication (5s)...');
-        await new Promise(r => setTimeout(r, 5000));
-        
-        // Check EU directly via DB? Or via API? 
-        // We implemented GET /:region/replication-lag but not GET /:region/properties/:id
-        // We can't easily check EU prop value via API unless we add GET endpoint.
-        // But the requirement didn't ask for GET properties endpoint.
-        // We can check logs or assume if lag is small/zero it worked, or check `demonstrate_failover` which shows EU handling requests.
-        // Actually, let's just log that we can't automatically verify replication value without GET endpoint or DB access here.
-        // But we can check replication lag.
-        
-        // Check replication lag on EU
-        // Using http to get /eu/replication-lag
-        // We need to implement a simple GET helper or use makeRequest with GET
-        const getLag = (region) => {
-             return new Promise((resolve) => {
-                http.get(`http://localhost:8080/${region}/replication-lag`, (res) => {
-                    let body = '';
-                    res.on('data', c => body += c);
-                    res.on('end', () => resolve(JSON.parse(body)));
-                });
-             });
-        };
-        
-        const lagRes = await getLag('eu');
-        console.log('EU Replication Lag:', lagRes);
-        if (lagRes && typeof lagRes.lag_seconds === 'number') {
-            console.log('SUCCESS: Replication lag endpoint works.');
-        } else {
-             console.error('FAILURE: Replication lag endpoint failed or returned invalid data.');
-        }
-    } else {
-        console.error('FAILURE: Update for replication test failed.');
-    }
+    await testReplication();
 
+    console.log('\n=== All tests complete. ===');
 })();
